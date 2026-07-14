@@ -191,6 +191,10 @@ CREATE POLICY branch_all_policy ON branches
     FOR ALL
     USING (current_user_role() = 'superadmin' OR tenant_id = current_tenant_id());
 
+CREATE POLICY branch_read_policy ON branches
+    FOR SELECT
+    USING (true); -- Clientes públicos pueden ver las sucursales para reservar
+
 -- POLÍTICAS PARA LA TABLA: users
 CREATE POLICY user_all_policy ON users
     FOR ALL
