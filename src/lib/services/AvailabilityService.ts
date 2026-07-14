@@ -1,11 +1,4 @@
-import {
-  services,
-  staffList,
-  branchesList,
-  workHours,
-  hasOverlappingBooking,
-  hasOverlappingTimeBlock
-} from "@/lib/mockDb";
+import { getSupabaseClient } from "@/lib/supabase";
 import {
   combineDateAndTimeInTimezone,
   getLocalDateDayOfWeek,
@@ -21,56 +14,95 @@ export class AvailabilityService {
     serviceId: string,
     dateStr: string // Formato 'YYYY-MM-DD'
   ): Promise<string[]> {
-    // 1. Validar existencia de servicio y profesional
-    const service = services.find((s) => s.id === serviceId);
-    if (!service) return [];
+    const supabase = await getSupabaseClient();
 
-    const staff = staffList.find((st) => st.id === staffId);
-    if (!staff) return [];
+    // 1. Obtener datos de servicio
+    const { data: service, error: srvError } = await supabase
+      .from("services")
+      .select("*")
+      .eq("id", serviceId)
+      .single();
+    
+    if (srvError || !service) return [];
 
-    const branch = branchesList.find((b) => b.id === staff.branchId);
-    if (!branch) return [];
+    // 2. Obtener datos de profesional
+    const { data: staff, error: staffError } = await supabase
+      .from("staff")
+      .select("*")
+      .eq("id", staffId)
+      .single();
 
-    // 2. Determinar día de la semana según el local
-    // Usamos una hora de mediodía representativa local para hallar el día de la semana sin conflictos de frontera
+    if (staffError || !staff) return [];
+
+    // 3. Obtener sucursal para huso horario
+    const { data: branch, error: branchError } = await supabase
+      .from("branches")
+      .select("*")
+      .eq("id", staff.branch_id)
+      .single();
+
+    if (branchError || !branch) return [];
+
+    // 4. Determinar día de la semana en el local
     const noonLocal = combineDateAndTimeInTimezone(dateStr, "12:00", branch.timezone);
     const dayOfWeek = getLocalDateDayOfWeek(noonLocal, branch.timezone);
 
-    // 3. Buscar horario laboral
-    const workHour = workHours.find(
-      (wh) => wh.staffId === staffId && wh.dayOfWeek === dayOfWeek
-    );
+    // 5. Buscar horario laboral de ese día
+    const { data: workHour, error: whError } = await supabase
+      .from("work_hours")
+      .select("*")
+      .eq("staff_id", staffId)
+      .eq("day_of_week", dayOfWeek)
+      .eq("is_active", true)
+      .maybeSingle();
 
-    if (!workHour || !workHour.isActive) {
-      return []; // El profesional no atiende este día
+    if (whError || !workHour) {
+      return []; // El profesional no trabaja o no está activo ese día
     }
 
-    // 4. Crear rango de horario laboral absoluto (UTC)
-    const workStart = combineDateAndTimeInTimezone(dateStr, workHour.startTime, branch.timezone);
-    const workEnd = combineDateAndTimeInTimezone(dateStr, workHour.endTime, branch.timezone);
+    // 6. Rango laboral del día en UTC
+    const workStart = combineDateAndTimeInTimezone(dateStr, workHour.start_time, branch.timezone);
+    const workEnd = combineDateAndTimeInTimezone(dateStr, workHour.end_time, branch.timezone);
 
-    // 5. Generar slots potenciales de inicio cada 15 minutos
+    // 7. Traer reservas activas y bloqueos de ese día para evitar solapamientos
+    const { data: activeBookings } = await supabase
+      .from("bookings")
+      .select("start_time, end_time")
+      .eq("staff_id", staffId)
+      .not("status", "in", '("cancelled","no_show")')
+      .lt("start_time", workEnd.toISOString())
+      .gt("end_time", workStart.toISOString());
+
+    const { data: activeBlocks } = await supabase
+      .from("time_blocks")
+      .select("start_time, end_time")
+      .eq("staff_id", staffId)
+      .lt("start_time", workEnd.toISOString())
+      .gt("end_time", workStart.toISOString());
+
+    const busyRanges = [
+      ...(activeBookings || []).map(b => ({ start: new Date(b.start_time), end: new Date(b.end_time) })),
+      ...(activeBlocks || []).map(tb => ({ start: new Date(tb.start_time), end: new Date(tb.end_time) }))
+    ];
+
+    // 8. Generar slots potenciales cada 15 minutos
     const availableSlots: string[] = [];
-    const durationMs = service.duration * 60000;
-    const stepMs = 15 * 60000; // Intervalos para inicio de turno
+    const durationMs = service.duration_minutes * 60000;
+    const stepMs = 15 * 60000;
 
     let currentStart = new Date(workStart);
 
     while (currentStart.getTime() + durationMs <= workEnd.getTime()) {
       const currentEnd = new Date(currentStart.getTime() + durationMs);
 
-      // Chequeo de colisiones contra citas
-      const isBooked = hasOverlappingBooking(staffId, currentStart, currentEnd);
+      // Comprobar colisión
+      const hasConflict = busyRanges.some(
+        busy => currentStart < busy.end && currentEnd > busy.start
+      );
 
-      // Chequeo de colisiones contra bloqueos administrativos
-      const isBlocked = hasOverlappingTimeBlock(staffId, currentStart, currentEnd);
-
-      const isOverlapped = isBooked || isBlocked;
-
-      // Chequeo de si el slot está en el pasado
       const isPast = currentStart.getTime() <= Date.now();
 
-      if (!isOverlapped && !isPast) {
+      if (!hasConflict && !isPast) {
         availableSlots.push(currentStart.toISOString());
       }
 
@@ -81,68 +113,112 @@ export class AvailabilityService {
   }
 
   /**
-   * Realiza todas las comprobaciones de reglas de negocio para crear una reserva.
+   * Realiza todas las comprobaciones de reglas de negocio para crear una reserva en Supabase.
    */
   static async validateBookingCreation(
     staffId: string,
     serviceId: string,
     start: Date
   ): Promise<{ isValid: boolean; error?: string }> {
-    const service = services.find((s) => s.id === serviceId);
-    if (!service) {
+    const supabase = await getSupabaseClient();
+
+    // 1. Obtener datos de servicio
+    const { data: service, error: srvError } = await supabase
+      .from("services")
+      .select("*")
+      .eq("id", serviceId)
+      .single();
+    
+    if (srvError || !service) {
       return { isValid: false, error: "El servicio seleccionado no existe." };
     }
 
-    const staff = staffList.find((st) => st.id === staffId);
-    if (!staff) {
+    // 2. Obtener datos de profesional
+    const { data: staff, error: staffError } = await supabase
+      .from("staff")
+      .select("*")
+      .eq("id", staffId)
+      .single();
+
+    if (staffError || !staff) {
       return { isValid: false, error: "El profesional seleccionado no existe." };
     }
 
-    const branch = branchesList.find((b) => b.id === staff.branchId);
-    if (!branch) {
-      return { isValid: false, error: "La sucursal del profesional no existe." };
+    // 3. Obtener sucursal
+    const { data: branch, error: branchError } = await supabase
+      .from("branches")
+      .select("*")
+      .eq("id", staff.branch_id)
+      .single();
+
+    if (branchError || !branch) {
+      return { isValid: false, error: "La sucursal del profesional no existe o es inválida." };
     }
 
-    const end = new Date(start.getTime() + service.duration * 60000);
+    const end = new Date(start.getTime() + service.duration_minutes * 60000);
 
-    // 1. No reservar en el pasado
+    // 4. No reservar en el pasado
     if (start.getTime() <= Date.now()) {
       return { isValid: false, error: "No es posible reservar en el pasado." };
     }
 
-    // 2. Obtener datos locales de la fecha solicitada
+    // 5. Obtener día local e info laboral
     const localDateStr = getLocalDateString(start, branch.timezone);
     const dayOfWeek = getLocalDateDayOfWeek(start, branch.timezone);
 
-    // 3. Verificar que trabaje este día
-    const workHour = workHours.find(
-      (wh) => wh.staffId === staffId && wh.dayOfWeek === dayOfWeek
-    );
+    const { data: workHour, error: whError } = await supabase
+      .from("work_hours")
+      .select("*")
+      .eq("staff_id", staffId)
+      .eq("day_of_week", dayOfWeek)
+      .eq("is_active", true)
+      .maybeSingle();
 
-    if (!workHour || !workHour.isActive) {
+    if (whError || !workHour) {
       return { isValid: false, error: "El profesional no trabaja el día de la cita solicitada." };
     }
 
-    // 4. Verificar que se encuentre dentro de su rango horario laboral
-    const workStart = combineDateAndTimeInTimezone(localDateStr, workHour.startTime, branch.timezone);
-    const workEnd = combineDateAndTimeInTimezone(localDateStr, workHour.endTime, branch.timezone);
+    // 6. Verificar rango horario de jornada
+    const workStart = combineDateAndTimeInTimezone(localDateStr, workHour.start_time, branch.timezone);
+    const workEnd = combineDateAndTimeInTimezone(localDateStr, workHour.end_time, branch.timezone);
 
     if (start < workStart || end > workEnd) {
       return {
         isValid: false,
-        error: `El horario seleccionado está fuera de la jornada laboral del profesional para ese día (${workHour.startTime} hs a ${workHour.endTime} hs).`
+        error: `El horario seleccionado está fuera de la jornada laboral del profesional para ese día (${workHour.start_time.substring(0, 5)} hs a ${workHour.end_time.substring(0, 5)} hs).`
       };
     }
 
-    // 5. Verificar solapamiento con otras reservas
-    const isBooked = hasOverlappingBooking(staffId, start, end);
-    if (isBooked) {
+    // 7. Verificar solapamiento con otras reservas en Supabase
+    const { data: overlappingBookings, error: bOverlapError } = await supabase
+      .from("bookings")
+      .select("id")
+      .eq("staff_id", staffId)
+      .not("status", "in", '("cancelled","no_show")')
+      .lt("start_time", end.toISOString())
+      .gt("end_time", start.toISOString());
+
+    if (bOverlapError) {
+      return { isValid: false, error: "Error al validar solapamiento de reservas." };
+    }
+
+    if (overlappingBookings && overlappingBookings.length > 0) {
       return { isValid: false, error: "El horario ya está reservado por otra cita." };
     }
 
-    // 6. Verificar solapamiento con bloqueos administrativos
-    const isBlocked = hasOverlappingTimeBlock(staffId, start, end);
-    if (isBlocked) {
+    // 8. Verificar solapamiento con bloqueos administrativos
+    const { data: overlappingBlocks, error: blockOverlapError } = await supabase
+      .from("time_blocks")
+      .select("id")
+      .eq("staff_id", staffId)
+      .lt("start_time", end.toISOString())
+      .gt("end_time", start.toISOString());
+
+    if (blockOverlapError) {
+      return { isValid: false, error: "Error al validar bloqueos de agenda." };
+    }
+
+    if (overlappingBlocks && overlappingBlocks.length > 0) {
       return { isValid: false, error: "El horario seleccionado está bloqueado por motivos administrativos." };
     }
 

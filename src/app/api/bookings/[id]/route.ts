@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { bookings } from "@/lib/mockDb";
+import { getSupabaseClient } from "@/lib/supabase";
 
 export async function PATCH(
   request: NextRequest,
@@ -17,22 +17,38 @@ export async function PATCH(
       );
     }
 
-    // Buscar la reserva en memoria
-    const booking = bookings.find((b) => b.id === id);
+    const supabase = await getSupabaseClient();
 
-    if (!booking) {
+    // Actualizar el estado de la reserva en Supabase (regulado por RLS)
+    const { data: booking, error } = await supabase
+      .from("bookings")
+      .update({ status })
+      .eq("id", id)
+      .select("*")
+      .single();
+
+    if (error || !booking) {
+      console.error("Error al actualizar reserva en Supabase:", error);
       return NextResponse.json(
-        { error: "Reserva no encontrada." },
+        { error: "Reserva no encontrada o sin permisos de edición." },
         { status: 404 }
       );
     }
 
-    // Actualizar el estado de la reserva
-    booking.status = status;
+    // Devolver formato mapeado para el cliente
+    const formattedBooking = {
+      id: booking.id,
+      branchId: booking.branch_id,
+      staffId: booking.staff_id,
+      serviceId: booking.service_id,
+      startTime: booking.start_time,
+      endTime: booking.end_time,
+      status: booking.status,
+    };
 
     return NextResponse.json({
       message: "Reserva actualizada correctamente.",
-      booking,
+      booking: formattedBooking,
     });
   } catch (error) {
     console.error("Error al actualizar la reserva:", error);
@@ -42,3 +58,4 @@ export async function PATCH(
     );
   }
 }
+

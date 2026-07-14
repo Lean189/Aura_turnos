@@ -13,23 +13,21 @@ import {
   DialogTitle,
   DialogFooter,
 } from "@/components/ui/dialog";
-import {
-  services,
-  staffList,
-  branchesList,
-  MockService,
-  MockStaff,
-  MockBooking,
-  MockBranch,
-} from "@/lib/mockDb";
+import { getAnonSupabaseClient } from "@/lib/supabase";
 
 export default function BookingPortal() {
+  // Estado para datos remotos de Supabase
+  const [branchesList, setBranchesList] = useState<any[]>([]);
+  const [servicesList, setServicesList] = useState<any[]>([]);
+  const [staffList, setStaffList] = useState<any[]>([]);
+  const [isLoadingData, setIsLoadingData] = useState<boolean>(true);
+
   // Estado para la sucursal seleccionada (Paso 0)
-  const [selectedBranch, setSelectedBranch] = useState<MockBranch | null>(null);
+  const [selectedBranch, setSelectedBranch] = useState<any | null>(null);
 
   // Estados de selección del turno
-  const [selectedService, setSelectedService] = useState<MockService | null>(null);
-  const [selectedStaff, setSelectedStaff] = useState<MockStaff | null>(null);
+  const [selectedService, setSelectedService] = useState<any | null>(null);
+  const [selectedStaff, setSelectedStaff] = useState<any | null>(null);
   const [selectedDate, setSelectedDate] = useState<Date | undefined>(new Date());
   const [selectedTimeSlot, setSelectedTimeSlot] = useState<string | null>(null);
 
@@ -45,11 +43,50 @@ export default function BookingPortal() {
 
   // Mensajes de error y modales
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
-  const [successBooking, setSuccessBooking] = useState<MockBooking | null>(null);
+  const [successBooking, setSuccessBooking] = useState<any | null>(null);
   const [isSuccessOpen, setIsSuccessOpen] = useState<boolean>(false);
 
+  // Cargar información inicial desde Supabase
+  useEffect(() => {
+    async function loadData() {
+      setIsLoadingData(true);
+      try {
+        const supabase = getAnonSupabaseClient();
+        
+        // 1. Cargar locales (branches)
+        const { data: branches } = await supabase.from("branches").select("*");
+        setBranchesList(branches || []);
+
+        // 2. Cargar servicios activos
+        const { data: srvs } = await supabase.from("services").select("*").eq("is_active", true);
+        const formattedServices = (srvs || []).map((s) => ({
+          id: s.id,
+          tenantId: s.tenant_id,
+          name: s.name,
+          duration: s.duration_minutes,
+          price: Number(s.price),
+        }));
+        setServicesList(formattedServices);
+
+        // 3. Cargar profesionales activos
+        const { data: staff } = await supabase.from("staff").select("*").eq("is_active", true);
+        const formattedStaff = (staff || []).map((st) => ({
+          id: st.id,
+          branchId: st.branch_id,
+          name: st.name,
+        }));
+        setStaffList(formattedStaff);
+      } catch (err) {
+        console.error("Error al inicializar datos:", err);
+      } finally {
+        setIsLoadingData(false);
+      }
+    }
+    loadData();
+  }, []);
+
   // Limpiar selecciones si se cambia de sucursal
-  const handleSelectBranch = (branch: MockBranch | null) => {
+  const handleSelectBranch = (branch: any | null) => {
     setSelectedBranch(branch);
     setSelectedService(null);
     setSelectedStaff(null);
@@ -151,8 +188,19 @@ export default function BookingPortal() {
   };
 
   // Filtrar servicios y staff por la sucursal seleccionada
-  const filteredServices = services.filter((s) => s.branchId === selectedBranch?.id);
+  const filteredServices = servicesList.filter((s) => s.tenantId === selectedBranch?.tenant_id);
   const filteredStaffList = staffList.filter((stf) => stf.branchId === selectedBranch?.id);
+
+  if (isLoadingData) {
+    return (
+      <div className="min-h-screen bg-neutral-950 text-neutral-100 flex items-center justify-center font-sans">
+        <div className="text-center space-y-4">
+          <div className="w-10 h-10 border-4 border-amber-400 border-t-transparent rounded-full animate-spin mx-auto" />
+          <p className="text-xs text-neutral-400 uppercase tracking-widest font-mono animate-pulse">Cargando Turnera...</p>
+        </div>
+      </div>
+    );
+  }
 
   // VISTA 1: Selección de Sucursal / Local (Paso 0)
   if (!selectedBranch) {
